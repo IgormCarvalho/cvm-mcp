@@ -16,7 +16,10 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "mcp[cli]>=1.2.0",
+    # Limite superior obrigatório: o servidor usa mcp.server.fastmcp.FastMCP,
+    # que foi removido na 2.0 (substituído por mcp.server.MCPServer). Sem o
+    # teto, uma reinstalação puxa a 2.0 e o servidor para de subir.
+    "mcp[cli]>=1.2.0,<2",
     "httpx>=0.27",
     "pandas>=2.0",
     "platformdirs>=4.0",
