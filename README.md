@@ -3,21 +3,48 @@
 Servidor [MCP](https://modelcontextprotocol.io) que busca e trata dados
 financeiros **direto do Portal de Dados Abertos da CVM**
 (`dados.cvm.gov.br`), sem depender de terceiros. Expõe tools para um
-cliente LLM (Claude Desktop, Claude Code, etc.) buscar empresas e calcular
-indicadores a partir das demonstrações financeiras (DFP) publicadas.
+cliente LLM (Claude Desktop, Claude Code, etc.) consultar as demonstrações
+financeiras publicadas pelas companhias abertas.
+
+A visão padrão é **trimestral**: as tools partem do último trimestre que a
+empresa publicou e devolvem os **12 meses anteriores, trimestre a
+trimestre**, com as contas contábeis como a CVM publica — sem indicadores
+calculados.
 
 ## O que ele faz
 
 | Tool | Quando usar |
 |---|---|
 | `buscar_empresa` | Resolver nome/CNPJ/código CVM antes de qualquer análise |
-| `analisar_empresa` | Pedido genérico ("analise a empresa X") — últimos 5 anos, indicadores padrão |
-| `obter_indicadores` | Pedido customizado de período (outro intervalo de anos, individual vs consolidado) |
-| `obter_demonstrativo_bruto` | Pesquisa livre em uma conta contábil específica, sem cálculo |
+| `analisar_empresa` | Pedido genérico ("analise a empresa X") — DRE dos últimos 4 trimestres |
+| `obter_demonstrativo_trimestral` | Outro demonstrativo (balanço, fluxo de caixa) ou mais de 4 trimestres |
+| `obter_demonstrativo_anual` | Quando o usuário pedir explicitamente o exercício anual fechado (DFP) |
 
 Todos os valores monetários são normalizados para **R$ milhões**. Veja
 [Limitações](#limitações-importantes) abaixo — a IA sempre recebe avisos
-quando um dado não pôde ser obtido ou é uma estimativa.
+quando um dado é derivado ou não pôde ser obtido.
+
+## Como o trimestre é montado
+
+O ITR da CVM publica **apenas 1T, 2T e 3T**, e já traz cada trimestre
+isolado além dos acumulados do exercício — então recortar um trimestre é
+filtrar período, não subtrair.
+
+O **4T não existe no ITR**. Ele é derivado como `exercício completo (DFP) −
+acumulado até o 3T (ITR)`, casado conta a conta pelo código contábil. Todo
+período assim vem marcado com `derivado: true` na resposta, junto de um
+aviso explícito.
+
+Duas consequências que valem entender:
+
+- **Contas de estoque nunca são derivadas.** BPA e BPP são saldos numa
+  data, então o fechamento do exercício já é o valor do 4T. Só as contas de
+  fluxo (DRE, DFC, DVA, DRA, DMPL) passam pela subtração.
+- **O "último trimestre" é por empresa, não global.** Exercícios sociais
+  não-calendário fecham em outros meses — a Camil, por exemplo, tem
+  trimestres mar–mai, jun–ago, set–nov e dez–fev. O servidor resolve isso
+  pelas datas de cada companhia, e o rótulo (`2T26`) sempre vem
+  acompanhado de `inicio` e `fim`.
 
 ## Instalação
 
@@ -82,10 +109,16 @@ Se preferir não instalar com pipx (Opção 3), use:
 
 ## Cache local
 
-Os arquivos baixados da CVM (cadastro + ZIPs anuais de DFP) ficam em cache
-local para não baixar de novo a cada consulta — a checagem usa
+Os arquivos baixados da CVM (cadastro + ZIPs anuais de ITR e DFP) ficam em
+cache local para não baixar de novo a cada consulta — a checagem usa
 ETag/Last-Modified, então atualizações no portal da CVM são detectadas
-automaticamente. Local padrão (via `platformdirs`, sem hardcode de SO):
+automaticamente.
+
+Vale dimensionar: os pacotes vêm compactados (~20–30 MB por ano), mas são
+extraídos para uso, e cada ano-tipo ocupa algumas centenas de MB em disco.
+A visão trimestral costuma tocar dois anos de ITR mais um de DFP.
+
+Local padrão (via `platformdirs`, sem hardcode de SO):
 
 - Windows: `%LOCALAPPDATA%\cvm-mcp`
 - macOS: `~/Library/Caches/cvm-mcp`
@@ -96,22 +129,25 @@ Para usar outro diretório (ex: ambientes restritos/CI), defina
 
 ## Limitações importantes
 
-- **EBITDA é sempre uma estimativa** calculada a partir de EBIT (conta
-  padrão da DRE) + Depreciação/Amortização extraída do fluxo de caixa —
-  não é necessariamente igual ao "EBITDA ajustado" que a empresa divulga
-  em release de resultados.
+- **O 4T é derivado, não publicado.** A CVM não divulga o 4º trimestre
+  isoladamente; o valor vem de `ano cheio − acumulado 9M`. Bate com o
+  exercício por construção, mas não é um número que a empresa reportou.
+- **Sem indicadores calculados.** Esta versão devolve contas contábeis
+  publicadas, não margens, ROE ou EBITDA. O código de indicadores continua
+  no repositório (`indicators.py`, `accounts.py`), sem estar ligado a
+  nenhuma tool, para ser readaptado à base trimestral depois.
 - **Sem dado de mercado**: a CVM não publica cotação, valor de mercado ou
   múltiplos (P/L, EV/EBITDA). Pedidos desse tipo ficam fora do escopo
   desta fonte.
-- **Bancos, seguradoras e afins** usam um plano de contas de DRE diferente
-  (não têm uma linha de "resultado antes do financeiro"), então
-  EBIT/EBITDA estimado não é comparável ao de empresas não financeiras —
-  o servidor sinaliza isso quando detecta o setor.
-- **Dívida líquida** só é calculada quando a empresa usa os códigos
-  contábeis padrão de Empréstimos e Financiamentos; quando não usa, o
-  indicador é omitido (não estimado por aproximação).
-- Nem toda empresa tem 5 anos de histórico (IPO recente, suspensão,
-  cancelamento de registro) — anos sem dado vêm com aviso, não com zero.
+- **Contas de estoque não se somam.** BPA e BPP são saldos: somar os 4
+  trimestres de patrimônio líquido não produz nada com significado. Só as
+  contas de fluxo podem ser acumuladas em 12 meses.
+- **Nem toda empresa tem 4 trimestres** (IPO recente, suspensão,
+  cancelamento de registro, atraso na entrega do ITR). A janela devolve os
+  períodos que existirem, sem preencher buraco com zero.
+- **Empresas do setor financeiro** usam um plano de contas de DRE
+  diferente, então os códigos contábeis não são comparáveis linha a linha
+  com os de empresas não financeiras.
 
 ## Desenvolvimento
 
@@ -129,9 +165,15 @@ src/cvm_mcp/
   config.py       # constantes e diretório de cache (cross-platform)
   cache.py        # download HTTP com cache condicional + extração de ZIP
   parsers.py      # leitura dos CSVs (encoding/separador da CVM)
-  accounts.py     # mapa do plano de contas da CVM -> itens financeiros
   cvm_client.py   # busca de empresas e carregamento dos demonstrativos
-  indicators.py   # cálculo dos indicadores a partir dos demonstrativos
-  models.py       # estruturas de dados (Company, YearFinancials)
+  quarters.py     # montagem da janela trimestral e derivação do 4T
+  models.py       # estruturas de dados (Company, Quarter)
   server.py       # servidor MCP (FastMCP) e definição das tools
+
+  accounts.py     # (inativo) mapa do plano de contas -> itens financeiros
+  indicators.py   # (inativo) cálculo de indicadores em base anual
 ```
+
+`accounts.py` e `indicators.py` não são importados por nenhuma tool nesta
+versão — ficam no repositório para servir de base quando os indicadores
+forem reintroduzidos em base trimestral.

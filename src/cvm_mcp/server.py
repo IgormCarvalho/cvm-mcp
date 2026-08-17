@@ -1,15 +1,19 @@
-"""Servidor MCP: expõe os dados/indicadores da CVM como tools para um
-cliente LLM (Claude Desktop, etc.) via stdio."""
+"""Servidor MCP: expõe os dados da CVM como tools para um cliente LLM
+(Claude Desktop, etc.) via stdio.
+
+A visão padrão é trimestral: as tools partem do último trimestre publicado
+pela empresa e devolvem os 12 meses anteriores, trimestre a trimestre, com
+as contas contábeis como a CVM publica — sem indicadores calculados.
+"""
 
 from __future__ import annotations
 
-import datetime
-from dataclasses import asdict
-
 from mcp.server.fastmcp import FastMCP
 
-from . import indicators
+from . import quarters
+from .config import TRIMESTRES_PADRAO
 from .cvm_client import (
+    STATEMENTS,
     CompanyNotFoundError,
     StatementNotAvailableError,
     company_statement_with_fallback,
@@ -21,8 +25,6 @@ from .models import Company
 
 mcp = FastMCP("cvm-mcp")
 
-ANOS_ANALISE_PADRAO = 5
-
 
 def _company_dict(company: Company) -> dict:
     return {
@@ -33,6 +35,36 @@ def _company_dict(company: Company) -> dict:
         "situacao_registro": company.situacao_registro,
         "situacao_emissor": company.situacao_emissor,
     }
+
+
+def _serie_trimestral(
+    company: Company, demonstrativo: str, n: int, consolidado: bool
+) -> tuple[list[dict], list[str]]:
+    """Monta a série de trimestres de um demonstrativo, agregando os avisos
+    sem repetir o mesmo texto em cada período."""
+    trimestres = quarters.ultimos_trimestres(company, n=n, consolidado=consolidado)
+    periodos: list[dict] = []
+    avisos: list[str] = []
+
+    for trimestre in trimestres:
+        contas, usou_consolidado, avisos_periodo = quarters.contas_do_trimestre(
+            company, trimestre, demonstrativo, consolidado
+        )
+        for aviso in avisos_periodo:
+            if aviso not in avisos:
+                avisos.append(aviso)
+        periodos.append(
+            {
+                "trimestre": trimestre.rotulo,
+                "inicio": trimestre.dt_ini,
+                "fim": trimestre.dt_fim,
+                "consolidado": usou_consolidado,
+                "derivado": trimestre.derivado,
+                "contas": contas,
+            }
+        )
+
+    return periodos, avisos
 
 
 @mcp.tool()
@@ -50,73 +82,104 @@ def buscar_empresa(consulta: str, limite: int = 10) -> dict:
 
 
 @mcp.tool()
-def analisar_empresa(nome_ou_cnpj: str) -> dict:
-    """Análise financeira padrão dos últimos 5 anos de uma empresa.
+def analisar_empresa(nome_ou_cnpj: str, consolidado: bool = True) -> dict:
+    """Visão trimestral padrão de uma empresa: a DRE dos últimos 12 meses,
+    trimestre a trimestre, terminando no último trimestre que a companhia
+    publicou na CVM.
 
-    Use quando o usuário pedir algo genérico como "analise a empresa X" sem
-    especificar período ou indicadores. Retorna, em R$ milhões e por ano:
-    Receita Líquida, EBIT, EBITDA estimado, Lucro Líquido, Margem Líquida,
-    Margem EBITDA, ROE, Liquidez Corrente, Dívida Bruta, Caixa, Dívida
-    Líquida e Dívida Líquida/EBITDA — sempre com avisos quando algum item
-    não pôde ser calculado a partir dos demonstrativos públicos da CVM (ex:
-    EBITDA é sempre uma estimativa, não o número "ajustado" da empresa; não
-    há dado de cotação/valor de mercado nesta fonte). Para pedidos
-    customizados (outro período, dado bruto, individual vs consolidado),
-    use obter_indicadores ou obter_demonstrativo_bruto.
+    Use quando o usuário pedir algo genérico como "analise a empresa X". Os
+    valores são contas contábeis publicadas, em R$ milhões, sem indicadores
+    calculados — cada trimestre vem isolado (não acumulado), então dá para
+    comparar períodos diretamente.
+
+    Atenção ao campo `derivado`: o 4º trimestre não é publicado no ITR e é
+    obtido por diferença contra o exercício completo do DFP. Para o balanço
+    (BPA/BPP) ou outros demonstrativos, use obter_demonstrativo_trimestral.
     """
     try:
         empresa = resolve_company(nome_ou_cnpj)
     except CompanyNotFoundError as exc:
         return {"encontrado": False, "aviso": str(exc)}
 
-    ano_atual = datetime.date.today().year
-    anos = list(range(ano_atual - ANOS_ANALISE_PADRAO, ano_atual))
-    historico = indicators.compute_history(empresa, anos, consolidado=True)
+    periodos, avisos = _serie_trimestral(empresa, "DRE", TRIMESTRES_PADRAO, consolidado)
+    if not periodos:
+        return {
+            "encontrado": False,
+            "empresa": _company_dict(empresa),
+            "aviso": "Nenhum trimestre publicado encontrado para esta empresa na CVM.",
+        }
 
     return {
         "encontrado": True,
         "empresa": _company_dict(empresa),
+        "demonstrativo": "DRE",
         "moeda": "BRL",
         "escala": "milhoes",
-        "consolidado_preferido": True,
-        "historico": [asdict(ano) for ano in historico],
+        "periodicidade": "trimestral",
+        "periodos": periodos,
+        "avisos": avisos,
     }
 
 
 @mcp.tool()
-def obter_indicadores(nome_ou_cnpj: str, ano_inicio: int, ano_fim: int, consolidado: bool = True) -> dict:
-    """Indicadores financeiros calculados para um intervalo de anos escolhido
-    pelo usuário (mesmos indicadores de analisar_empresa, mas com período e
-    versão consolidado/individual livres). Use para pedidos customizados que
-    fogem do padrão de 5 anos."""
-    try:
-        empresa = resolve_company(nome_ou_cnpj)
-    except CompanyNotFoundError as exc:
-        return {"encontrado": False, "aviso": str(exc)}
-
-    if ano_fim < ano_inicio:
-        return {"encontrado": False, "aviso": "ano_fim deve ser maior ou igual a ano_inicio."}
-
-    anos = list(range(ano_inicio, ano_fim + 1))
-    historico = indicators.compute_history(empresa, anos, consolidado=consolidado)
-    return {
-        "encontrado": True,
-        "empresa": _company_dict(empresa),
-        "moeda": "BRL",
-        "escala": "milhoes",
-        "consolidado_preferido": consolidado,
-        "historico": [asdict(ano) for ano in historico],
-    }
-
-
-@mcp.tool()
-def obter_demonstrativo_bruto(nome_ou_cnpj: str, ano: int, demonstrativo: str, consolidado: bool = True) -> dict:
-    """Devolve as contas contábeis brutas (código, descrição, valor em R$
-    milhões) de um demonstrativo publicado pela CVM, sem nenhum cálculo.
+def obter_demonstrativo_trimestral(
+    nome_ou_cnpj: str,
+    demonstrativo: str,
+    trimestres: int = TRIMESTRES_PADRAO,
+    consolidado: bool = True,
+) -> dict:
+    """Contas de um demonstrativo específico ao longo dos últimos trimestres
+    publicados, terminando no mais recente disponível na CVM.
 
     demonstrativo: um de BPA, BPP, DRE, DFC_MD, DFC_MI, DVA, DMPL, DRA.
-    Use quando o usuário pedir algo que os indicadores prontos não cobrem,
-    como uma conta contábil específica ou maior nível de detalhe.
+    trimestres: quantos períodos retroceder (4 = últimos 12 meses).
+
+    BPA e BPP são saldos na data de fechamento de cada trimestre; os demais
+    são o movimento do trimestre isolado. Use para o balanço patrimonial, o
+    fluxo de caixa, ou para ir além dos 12 meses padrão.
+    """
+    try:
+        empresa = resolve_company(nome_ou_cnpj)
+    except CompanyNotFoundError as exc:
+        return {"encontrado": False, "aviso": str(exc)}
+
+    demonstrativo = demonstrativo.upper()
+    if demonstrativo not in STATEMENTS:
+        return {"encontrado": False, "aviso": f"Demonstrativo desconhecido: {demonstrativo}. Use um de {list(STATEMENTS)}."}
+    if trimestres < 1:
+        return {"encontrado": False, "aviso": "trimestres deve ser no mínimo 1."}
+
+    periodos, avisos = _serie_trimestral(empresa, demonstrativo, trimestres, consolidado)
+    if not periodos:
+        return {
+            "encontrado": False,
+            "empresa": _company_dict(empresa),
+            "aviso": f"Nenhum trimestre com {demonstrativo} encontrado para esta empresa.",
+        }
+
+    return {
+        "encontrado": True,
+        "empresa": _company_dict(empresa),
+        "demonstrativo": demonstrativo,
+        "moeda": "BRL",
+        "escala": "milhoes",
+        "periodicidade": "trimestral",
+        "tipo_conta": "estoque" if demonstrativo in quarters.ESTOQUE else "fluxo",
+        "periodos": periodos,
+        "avisos": avisos,
+    }
+
+
+@mcp.tool()
+def obter_demonstrativo_anual(
+    nome_ou_cnpj: str, ano: int, demonstrativo: str, consolidado: bool = True
+) -> dict:
+    """Contas de um demonstrativo do exercício ANUAL fechado (DFP), sem
+    recorte trimestral.
+
+    Use só quando o usuário pedir explicitamente o ano fechado — a visão
+    padrão deste servidor é trimestral (analisar_empresa,
+    obter_demonstrativo_trimestral).
     """
     try:
         empresa = resolve_company(nome_ou_cnpj)
@@ -124,7 +187,9 @@ def obter_demonstrativo_bruto(nome_ou_cnpj: str, ano: int, demonstrativo: str, c
         return {"encontrado": False, "aviso": str(exc)}
 
     try:
-        df, usou_consolidado = company_statement_with_fallback(empresa, ano, demonstrativo.upper(), consolidado)
+        df, usou_consolidado = company_statement_with_fallback(
+            empresa, ano, demonstrativo.upper(), consolidado, tipo="DFP"
+        )
     except (StatementNotAvailableError, ValueError) as exc:
         return {"encontrado": False, "aviso": str(exc)}
 
@@ -141,6 +206,7 @@ def obter_demonstrativo_bruto(nome_ou_cnpj: str, ano: int, demonstrativo: str, c
         "consolidado": usou_consolidado,
         "moeda": "BRL",
         "escala": "milhoes",
+        "periodicidade": "anual",
         "contas": contas,
     }
 

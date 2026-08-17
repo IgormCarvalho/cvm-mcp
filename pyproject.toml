@@ -29,4 +29,4 @@ cvm-mcp = "cvm_mcp.__main__:main"
 packages = ["src/cvm_mcp"]
 
 [project.urls]
-Homepage = "https://github.com/seu-usuario/cvm-mcp"
+Homepage = "https://github.com/IgormCarvalho/cvm-mcp"

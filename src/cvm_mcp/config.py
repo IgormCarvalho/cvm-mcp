@@ -21,6 +21,11 @@ CVM_CSV_SEP = ";"
 
 # Primeiro ano com dados no padrão atual do portal de dados abertos.
 DFP_FIRST_YEAR = 2010
+# Limite inferior da varredura para trás ao montar a janela de trimestres.
+ITR_FIRST_YEAR = 2011
+
+# Quantos trimestres a análise padrão devolve (12 meses).
+TRIMESTRES_PADRAO = 4
 
 HTTP_TIMEOUT_SECONDS = 60.0
 HTTP_USER_AGENT = f"{APP_NAME}/0.1 (+https://dados.cvm.gov.br)"

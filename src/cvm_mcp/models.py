@@ -25,6 +25,31 @@ class Company:
         return any(palavra in setor for palavra in palavras)
 
 
+@dataclass(frozen=True)
+class Quarter:
+    """Um trimestre de uma empresa, sempre identificado pelas datas além do
+    rótulo: exercícios sociais não-calendário fazem o "2T" fechar em maio ou
+    agosto, então só o par (dt_ini, dt_fim) é inequívoco.
+
+    origem indica a procedência do dado: "ITR" para trimestre publicado, e
+    "DFP-ITR" para o 4T, que é derivado por diferença.
+    """
+
+    ano: int
+    numero: int
+    dt_ini: str
+    dt_fim: str
+    origem: str
+
+    @property
+    def rotulo(self) -> str:
+        return f"{self.numero}T{self.ano % 100:02d}"
+
+    @property
+    def derivado(self) -> bool:
+        return self.origem == "DFP-ITR"
+
+
 @dataclass
 class YearFinancials:
     ano: int
