@@ -1,8 +1,12 @@
 # cvm-mcp
 
 Servidor [MCP](https://modelcontextprotocol.io) que busca e trata dados
-financeiros **direto do Portal de Dados Abertos da CVM**
-(`dados.cvm.gov.br`), sem depender de terceiros. Expõe tools para um
+financeiros **direto das fontes oficiais**, sem depender de terceiros:
+
+- **CVM** (Brasil): Portal de Dados Abertos (`dados.cvm.gov.br`)
+- **SEC/EDGAR** (EUA): APIs de dados XBRL (`data.sec.gov`). Veja a seção
+  [Empresas dos EUA (SEC)](#empresas-dos-eua-sec).
+ Expõe tools para um
 cliente LLM (Claude Desktop, Claude Code, etc.) consultar as demonstrações
 financeiras publicadas pelas companhias abertas.
 
@@ -149,6 +153,111 @@ Para usar outro diretório (ex: ambientes restritos/CI), defina
   diferente, então os códigos contábeis não são comparáveis linha a linha
   com os de empresas não financeiras.
 
+## Empresas dos EUA (SEC)
+
+As tools com prefixo `sec_` trazem as demonstrações de companhias
+registradas na SEC, a partir das APIs oficiais e gratuitas de XBRL. O
+formato da resposta é o mesmo das tools da CVM (`periodos`, `derivado`,
+`contas`, `avisos`).
+
+| Tool | Quando usar |
+|---|---|
+| `sec_buscar_empresa` | Resolver ticker/CIK/nome antes de qualquer análise |
+| `sec_analisar_empresa` | Pedido genérico: DRE padronizada dos últimos 4 trimestres |
+| `sec_obter_demonstrativo_trimestral` | DRE, BPA, BPP ou DFC, por quantos trimestres quiser |
+| `sec_obter_demonstrativo_anual` | Exercício fiscal fechado (10-K, 20-F, 40-F) |
+| `sec_obter_conta_xbrl` | Qualquer tag XBRL fora do mapa padrão (ex: `LongTermDebt`) |
+
+### Configuração obrigatória: identificação
+
+A SEC exige que todo acesso automatizado se identifique com **nome e
+e-mail** no User-Agent ([regra da SEC](https://www.sec.gov/os/accessing-edgar-data));
+sem isso ela responde 403. O valor é pessoal, por isso vem de variável de
+ambiente e **nunca fica no código**:
+
+```json
+{
+  "mcpServers": {
+    "cvm": {
+      "command": "cvm-mcp",
+      "env": { "SEC_MCP_USER_AGENT": "Seu Nome seu@email.com" }
+    }
+  }
+}
+```
+
+Sem a variável, as tools da CVM continuam funcionando normalmente; as da
+SEC devolvem um aviso explicando como configurar.
+
+### Fontes usadas
+
+| Endpoint | Para quê |
+|---|---|
+| `www.sec.gov/files/company_tickers.json` | Ticker → CIK |
+| `data.sec.gov/submissions/CIK##########.json` | Cadastro: setor (SIC), fim do exercício fiscal, bolsas, tipo de emissor |
+| `data.sec.gov/api/xbrl/companyfacts/CIK##########.json` | Todos os valores XBRL já reportados pela empresa |
+
+### Como os dados são tratados
+
+- **Padronização de contas** (`sec/mapping.py`): cada empresa escolhe suas
+  tags XBRL (a receita pode ser `Revenues`, `RevenueFromContractWith...`,
+  `SalesRevenueNet`...). Cada conta padrão tem uma lista ordenada de tags
+  candidatas, US-GAAP e IFRS, e a resposta informa em `tag_xbrl` qual foi
+  usada. Os códigos (1 = ativo, 2 = passivo e PL, 3 = resultado, 6 = caixa)
+  imitam a estrutura da CVM para leitura lado a lado, mas não são oficiais.
+- **4º trimestre derivado**: `anual (10-K) − acumulado até o 3T`, na mesma
+  tag, marcado com `derivado: true`, como na CVM.
+- **Fluxo de caixa acumulado**: o 10-Q costuma trazer o DFC só acumulado no
+  ano (3, 6, 9 meses); o trimestre isolado sai da diferença entre
+  acumulados e também vem com `derivado: true`.
+- **LPA e número de ações** nunca são derivados por subtração (não é
+  aritmeticamente válido); no 4T derivado ficam ausentes.
+- **Reapresentações**: quando o mesmo período foi reportado com valores
+  diferentes (emenda ou comparativo corrigido), fica a entrega mais recente,
+  com `reapresentado: true`.
+- **Rastreabilidade**: toda conta traz `formulario`, `acessao` (número de
+  acesso no EDGAR) e `arquivado_em`.
+- **Exercício fiscal da empresa**: a Apple fecha em setembro, varejistas em
+  janeiro. O rótulo (`4T25`) usa o ano fiscal que a empresa declarou, e vem
+  sempre com `inicio`/`fim`.
+- **Checagem do balanço**: se ativo total ≠ passivo + PL (tolerância de
+  0,5%), sai um aviso.
+
+### Uso seguro da API
+
+- **Limite de taxa**: no máximo 8 requisições/s (a SEC permite 10).
+- **Cache local** em `<cache_dir>/sec`: dentro de algumas horas nem consulta
+  a SEC; depois revalida por ETag/Last-Modified. Se a SEC estiver fora do
+  ar, usa a cópia em cache e avisa.
+- **Retentativa** com espera crescente para respostas 429/5xx.
+- Só entram valores de formulários de demonstrações (10-K, 10-Q, 20-F,
+  40-F, 6-K e emendas). Fatos de 8-K, prospectos etc. são descartados.
+
+### Limitações da fonte SEC
+
+- **Emissores estrangeiros** (20-F/40-F, ex: Nu Holdings `NU`): a SEC só
+  exige XBRL no relatório anual. Os trimestres entregues em 6-K
+  normalmente não são estruturados, então a visão trimestral pode vir
+  vazia; use `sec_obter_demonstrativo_anual`.
+- **Sinal**: valores como no XBRL, com custos e despesas positivos (na CVM
+  vêm negativos).
+- **Sem dado de mercado**: cotação, valor de mercado e múltiplos não vêm da
+  SEC.
+- **Bancos e seguradoras** usam tags próprias; o mapa cobre as principais
+  (receita de juros, provisão para perdas, carteira, depósitos), e o resto
+  sai por `sec_obter_conta_xbrl`.
+
+### Testes
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+Os testes rodam offline, com empresas sintéticas que reproduzem o formato
+real das APIs da SEC (exercício calendário, exercício em setembro, emissor
+estrangeiro IFRS, reapresentação, DFC acumulado).
+
 ## Desenvolvimento
 
 ```bash
@@ -169,6 +278,14 @@ src/cvm_mcp/
   quarters.py     # montagem da janela trimestral e derivação do 4T
   models.py       # estruturas de dados (Company, Quarter)
   server.py       # servidor MCP (FastMCP) e definição das tools
+  sec/            # fonte SEC/EDGAR (EUA)
+    config.py     # endpoints, limites e User-Agent (variável de ambiente)
+    http.py       # download com limite de taxa, retentativa e cache condicional
+    companies.py  # ticker/CIK → cadastro
+    facts.py      # leitura e consolidação dos company facts XBRL
+    mapping.py    # mapa de tags XBRL → contas padronizadas
+    periods.py    # calendário fiscal, trimestres e derivações
+    service.py    # monta as respostas das tools sec_*
 
   accounts.py     # (inativo) mapa do plano de contas -> itens financeiros
   indicators.py   # (inativo) cálculo de indicadores em base anual
